@@ -1,5 +1,7 @@
 # claude-model-router
 
+[中文说明](README.zh-CN.md)
+
 A two-sided setup that lets **Claude Code** and **Codex** share one multi-model routing stack:
 
 - On the **Claude Code** side, local Anthropic-compatible shims sit between the CLI and any
