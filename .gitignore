@@ -1,0 +1,5 @@
+__pycache__/
+*.bak*
+*.log
+exec_route.json
+opencode_keys.json

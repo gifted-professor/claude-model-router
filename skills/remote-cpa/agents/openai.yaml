@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remote CPA v2"
+  short_description: "Safely route Codex and model calls through the private CPA."
+  default_prompt: "Use $remote-cpa to list live models, send text requests, or route explicit image work through the Mac mini Dashboard into CPA."

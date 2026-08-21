@@ -1,0 +1,6 @@
+interface:
+  display_name: "Multi-model Review Gate"
+  short_description: "Bounded plan and implementation review routing"
+  default_prompt: "Use $multi-model-review-gate to review this plan or completed implementation once, converge the findings, and stop without review loops."
+policy:
+  allow_implicit_invocation: true
