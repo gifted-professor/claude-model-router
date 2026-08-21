@@ -149,7 +149,12 @@ def _estimate_tokens(payload):
     collect(payload.get("messages", []))
     collect(payload.get("tools", []))
     text = "\n".join(text_parts)
-    return max(1, (len(text.encode("utf-8")) + 3) // 4)
+    # CJK 字符按 ~1 token/个、其余按 ~4 字节/token 估算。
+    # 纯字节数÷4 会把中文低估约 25%（1 汉字 3 字节≈0.75，实际 1~1.5 token），
+    # 会影响 Claude Code 的 compact 时机判断。
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E7F)
+    rest_bytes = len(text.encode("utf-8")) - 3 * cjk
+    return max(1, cjk + (rest_bytes + 3) // 4)
 
 
 _ROUTE_HARD = set()  # 判过 hard 的会话首条消息指纹，命中后本会话固定 glm-5.2（只升不降）
@@ -343,6 +348,10 @@ def translate_request(payload):
     # max_tokens 全部烧在 reasoning 上（实测：全空 + 40s → 15s + 正常内容）。
     if "reasoning_effort" not in out:
         out["reasoning_effort"] = os.environ.get("OPENCODE_REASONING_EFFORT", "low")
+    # 流式时让上游在末尾 chunk 带真实 usage，回填进 message_delta，
+    # 让 Claude Code 的 compact 判断基于真实 token 数而不是估算。
+    if out["stream"]:
+        out["stream_options"] = {"include_usage": True}
 
     tools = payload.get("tools")
     if tools:
@@ -429,6 +438,8 @@ def translate_stream(lines, model, request_id, input_tokens):
     text_block_index = None
     tool_blocks = {}  # openai tc index -> {"block_index", "id", "name", "started"}
     next_block_index = 0
+    real_usage = {}  # 上游末尾 chunk 带回来的真实 token 统计
+    final_finish = None  # 收到 finish_reason 后延迟到流末尾再收尾
 
     for raw in lines:
         line = raw.decode("utf-8", errors="replace").strip()
@@ -441,6 +452,9 @@ def translate_stream(lines, model, request_id, input_tokens):
             chunk = json.loads(data)
         except Exception:
             continue
+        # include_usage 开启后，末尾会有一个 choices 为空、只带 usage 的 chunk，先存起来
+        if chunk.get("usage"):
+            real_usage.update(chunk["usage"])
         choices = chunk.get("choices") or []
         if not choices:
             continue
@@ -522,13 +536,20 @@ def translate_stream(lines, model, request_id, input_tokens):
                     open_blocks.append(block["block_index"])
             for idx in open_blocks:
                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
-            yield _sse("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": _STOP_REASON.get(finish, "end_turn"), "stop_sequence": None},
-                "usage": {"output_tokens": 0},
-            })
-            yield _sse("message_stop", {"type": "message_stop"})
-            return
+            # 不立刻收尾：usage chunk 在 finish 之后才到，记一下继续读
+            final_finish = finish
+
+    # 流结束（[DONE] / eof / finish 后无更多 chunk），发 message_delta + message_stop
+    if final_finish and sent_start:
+        yield _sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": _STOP_REASON.get(final_finish, "end_turn"), "stop_sequence": None},
+            "usage": {
+                "input_tokens": real_usage.get("prompt_tokens", input_tokens),
+                "output_tokens": real_usage.get("completion_tokens", 0),
+            },
+        })
+        yield _sse("message_stop", {"type": "message_stop"})
 
 
 # ── 上游泵 / 心跳 ──────────────────────────────────────────────────────────
