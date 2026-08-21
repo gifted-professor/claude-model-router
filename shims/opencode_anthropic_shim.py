@@ -17,13 +17,19 @@ OpenCode Go 路由：主模型 glm-5.3，副手 deepseek-v4-flash。与 cpa_anth
 import argparse
 import json
 import os
+import queue as _queue
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, ProxyHandler
+
+# 上游 opencode.ai 国内直连足够快（实测直连 0.78s vs 经 Clash 0.79~0.92s），
+# 且 urllib 在 Windows 会自动读系统代理（Clash 7897）。直连 opener：不受系统
+# 代理开关影响，少一跳，也少一个故障点。
+_DIRECT_OPENER = build_opener(ProxyHandler({}))
 
 DEFAULT_MODEL = os.environ.get("OPENCODE_SHIM_MODEL", "glm-5.3")
 KEYS_FILE = os.environ.get(
@@ -45,6 +51,27 @@ _HARD_SIGNALS = (
     "协议", "跨系统", "架构", "生产", "部署", "不可逆", "回滚",
 )
 
+# ── 稳定性参数 ─────────────────────────────────────────────────────────────
+# UPSTREAM_TIMEOUT: urlopen 单次阻塞 I/O 上限（连接、读 chunk 各自计时）。
+# MAX_ATTEMPTS: 上游连接失败 / 5xx / 429 / 空流时的最大尝试次数（指数退避）。
+# HEARTBEAT_INTERVAL: 流式响应先回 200，之后按此间隔发 SSE ping，
+# 上游再慢 Claude Code 也不会误判超时进入指数退避（"retry in 4m10s" 的根因）。
+UPSTREAM_TIMEOUT = 300
+MAX_ATTEMPTS = 3
+HEARTBEAT_INTERVAL = 15
+
+# ── 双上游分流 ─────────────────────────────────────────────────────────────
+# opencode 只保留 glm-5.3；其余模型转发给本地 ollama shim（127.0.0.1:11435，
+# 原生 Anthropic 协议，自带 key 轮换，无需翻译）。设 OPENCODE_SPLIT=off 关闭。
+OLLAMA_SHIM_URL = os.environ.get("OLLAMA_SHIM_URL", "http://127.0.0.1:11435").rstrip("/")
+_SPLIT = os.environ.get("OPENCODE_SPLIT", "on").lower() != "off"
+OPENCODE_ONLY_MODELS = {"glm-5.3"}
+# ollama.com 上的实际模型名映射（名单见 https://ollama.com/v1/models）
+OLLAMA_MODEL_MAP = {
+    "deepseek-v4-flash": "deepseek-v4-flash:preview",
+    "glm-5.2": "glm-5.2",
+}
+
 _KEY_LOCK = threading.RLock()
 _CONFIG_CACHE = {"value": None, "at": 0.0}
 _CONFIG_TTL = 60  # seconds
@@ -58,9 +85,20 @@ _STOP_REASON = {
 }
 
 
+_LOG_FILE = os.environ.get(
+    "OPENCODE_SHIM_LOG", os.path.expanduser("~/.claude/opencode_shim.log")
+)
+
+
 def _log(message):
     stream = getattr(sys, "stderr", None)
     if stream is None:
+        # pythonw 下 stderr 为 None（开机自启场景），落到日志文件保证可排查。
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(str(message) + "\n")
+        except Exception:
+            pass
         return
     try:
         stream.write(str(message) + "\n")
@@ -493,6 +531,76 @@ def translate_stream(lines, model, request_id, input_tokens):
             return
 
 
+# ── 上游泵 / 心跳 ──────────────────────────────────────────────────────────
+
+def _pump_upstream(req, q):
+    """后台线程：打开上游响应，把 ('headers', headers) / ('line', raw) /
+    ('eof', None) / ('err', exc) 依次推入队列。urlopen 失败直接 ('err', ...)。"""
+    resp = None
+    try:
+        resp = _DIRECT_OPENER.open(req, timeout=UPSTREAM_TIMEOUT)
+        q.put(("headers", resp.headers))
+        for raw in resp:
+            q.put(("line", raw))
+        q.put(("eof", None))
+    except Exception as exc:
+        q.put(("err", exc))
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+def _queue_lines(q):
+    """把泵线程的队列条目转成 translate_stream 需要的 line 迭代器。"""
+    while True:
+        kind, val = q.get()
+        if kind == "line":
+            yield val
+        elif kind == "eof":
+            return
+        elif kind == "err":
+            raise val
+
+
+class _Heartbeat(threading.Thread):
+    """每 interval 秒向客户端写一个 SSE ping，保持连接有字节流动。"""
+    def __init__(self, write_fn, interval=HEARTBEAT_INTERVAL):
+        super().__init__(daemon=True)
+        self._write = write_fn
+        self._interval = interval
+        self._done = threading.Event()
+
+    def run(self):
+        while not self._done.wait(self._interval):
+            try:
+                self._write(_sse("ping", {"type": "ping"}))
+            except Exception:
+                return
+
+    def stop(self):
+        self._done.set()
+
+
+def _retryable(exc):
+    """连接层错误、超时、429、5xx 都可重试；其余 4xx 是硬错误。"""
+    if isinstance(exc, HTTPError):
+        return exc.code == 429 or exc.code >= 500
+    return True  # URLError / timeout / ConnectionResetError 等
+
+
+def _error_text(exc):
+    if isinstance(exc, HTTPError):
+        try:
+            body = exc.read()[:300].decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return f"upstream HTTP {exc.code}: {body}"
+    return f"upstream error: {exc}"
+
+
 # ── HTTP Handler ────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -567,6 +675,10 @@ class Handler(BaseHTTPRequestHandler):
         if route_note:
             _log(f"exec_route: {route_note} -> {model}")
 
+        if _SPLIT and model not in OPENCODE_ONLY_MODELS:
+            self._forward_ollama(payload, model, stream)
+            return
+
         try:
             base_url, api_key = _load_config()
         except Exception as exc:
@@ -588,35 +700,131 @@ class Handler(BaseHTTPRequestHandler):
         }
         req = Request(target, data=_json_bytes(openai_payload), headers=headers, method="POST")
 
-        try:
-            with urlopen(req, timeout=600) as resp:
-                if stream:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    request_id = str(resp.headers.get("x-request-id", "")) or str(time.time())
-                    for event in translate_stream(resp, model, request_id, input_tokens):
-                        self.wfile.write(event.encode("utf-8"))
-                        self.wfile.flush()
+        if stream:
+            self._proxy_stream(req, model, input_tokens)
+            return
+
+        last_err = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                with _DIRECT_OPENER.open(req, timeout=UPSTREAM_TIMEOUT) as resp:
+                    resp_body = resp.read()
+                    try:
+                        openai_resp = json.loads(resp_body.decode("utf-8"))
+                        anthropic_resp = translate_response(openai_resp, model)
+                        self._send(200, _json_bytes(anthropic_resp))
+                    except Exception as exc:
+                        _log(f"response_translate_error: {exc} body={resp_body[:200]}")
+                        self._send(502, _json_bytes({"error": {"type": "upstream_error", "message": str(exc)}}))
                     return
-                resp_body = resp.read()
-                try:
-                    openai_resp = json.loads(resp_body.decode("utf-8"))
-                    anthropic_resp = translate_response(openai_resp, model)
-                    self._send(200, _json_bytes(anthropic_resp))
-                except Exception as exc:
-                    _log(f"response_translate_error: {exc} body={resp_body[:200]}")
-                    self._send(502, _json_bytes({"error": {"type": "upstream_error", "message": str(exc)}}))
-                return
+            except Exception as exc:
+                last_err = exc
+                if isinstance(exc, HTTPError) and not _retryable(exc):
+                    err_body = exc.read()
+                    _log(f"upstream_http_error status={exc.code} body={err_body[:200]}")
+                    self._send(exc.code, err_body, exc.headers.get("content-type", "application/json"))
+                    return
+                _log(f"upstream attempt {attempt}/{MAX_ATTEMPTS} failed: {exc}")
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(2 * attempt)
+        _log(f"upstream exhausted after {MAX_ATTEMPTS} attempts: {last_err}")
+        self._send(502, _json_bytes({"error": {"type": "upstream_error", "message": _error_text(last_err)}}))
+
+    def _forward_ollama(self, payload, model, stream):
+        """非 glm-5.3 模型：原始 Anthropic 报文透传给本地 ollama shim，
+        只做模型名映射；key 轮换/重试由 ollama shim 自己处理。"""
+        mapped = OLLAMA_MODEL_MAP.get(model, model)
+        out = dict(payload)
+        out["model"] = mapped
+        _log(f"split_route: {model} -> ollama/{mapped}")
+        req = Request(
+            OLLAMA_SHIM_URL + "/v1/messages",
+            data=_json_bytes(out),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _DIRECT_OPENER.open(req, timeout=600) as resp:
+                content_type = resp.headers.get("content-type", "application/json")
+                self.send_response(resp.status)
+                self.send_header("Content-Type", content_type)
+                if "event-stream" in content_type:
+                    self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
         except HTTPError as exc:
             err_body = exc.read()
-            _log(f"upstream_http_error status={exc.code} body={err_body[:200]}")
+            _log(f"ollama_forward_http_error status={exc.code} body={err_body[:200]}")
             self._send(exc.code, err_body, exc.headers.get("content-type", "application/json"))
-        except URLError as exc:
-            _log(f"upstream_urlerror: {exc}")
-            self._send(502, _json_bytes({"error": {"type": "upstream_error", "message": str(exc)}}))
+        except Exception as exc:
+            _log(f"ollama_forward_error: {exc}")
+            self._send(502, _json_bytes({"error": {"type": "upstream_error", "message": f"ollama forward failed: {exc}"}}))
+
+    def _proxy_stream(self, req, model, input_tokens):
+        """流式转发：立即回 200 + SSE 头，心跳线程保活；上游失败在发出
+        message_start 之前可整请求重试，之后降级为 SSE error 事件。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        wlock = threading.Lock()
+
+        def write(s):
+            with wlock:
+                self.wfile.write(s.encode("utf-8"))
+                self.wfile.flush()
+
+        heartbeat = _Heartbeat(write)
+        heartbeat.start()
+        try:
+            last_err = None
+            for attempt in range(1, MAX_ATTEMPTS + 1):
+                sent_content = False
+                q = _queue.Queue()
+                threading.Thread(target=_pump_upstream, args=(req, q), daemon=True).start()
+                try:
+                    kind, val = q.get()
+                    if kind == "err":
+                        raise val
+                    if kind == "eof":
+                        raise URLError("upstream closed with empty stream")
+                    # kind == "headers"
+                    request_id = str(val.get("x-request-id", "")) or str(time.time())
+                    sent_content = False
+                    for event in translate_stream(_queue_lines(q), model, request_id, input_tokens):
+                        write(event)
+                        sent_content = True
+                    if not sent_content:
+                        raise URLError("upstream stream produced no content")
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    if not _retryable(exc):
+                        _log(f"upstream hard error (stream): {_error_text(exc)}")
+                        break
+                    _log(f"upstream stream attempt {attempt}/{MAX_ATTEMPTS} failed: {exc}")
+                    # sent_content 为 True 说明 message_start 已发出，整请求重试会
+                    # 产生重复 content block，只能降级为 error 事件。
+                    if sent_content:
+                        break
+                    if attempt < MAX_ATTEMPTS:
+                        time.sleep(2 * attempt)
+            write(_sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": _error_text(last_err)},
+            }))
+        except Exception as exc:
+            _log(f"stream client write failed: {exc}")
+        finally:
+            heartbeat.stop()
 
 
 def main():

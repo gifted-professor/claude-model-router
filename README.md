@@ -40,7 +40,7 @@ reads it. It carries a TTL (default 2h); after expiry the shim falls back to its
 
 | Path | What it is |
 |---|---|
-| `shims/opencode_anthropic_shim.py` | Anthropic `/v1/messages` → OpenAI `/chat/completions` proxy with exec-tier auto routing, session stickiness, skill route-file support, `reasoning_effort` defaulting |
+| `shims/opencode_anthropic_shim.py` | Anthropic `/v1/messages` → OpenAI `/chat/completions` proxy with exec-tier auto routing, session stickiness, skill route-file support, `reasoning_effort` defaulting; built-in SSE heartbeat (15s ping, prevents client exponential backoff on slow upstreams), upstream retry (3 attempts, exponential backoff), mid-stream failure degraded to an SSE error event, direct connection bypassing the system proxy; optional dual-upstream split — `glm-5.3` stays on opencode, all other models are forwarded to the local ollama shim |
 | `shims/ollama_anthropic_shim.py` | Same idea for a local Ollama backend |
 | `shims/cpa_anthropic_shim.py` | Same idea for a cli-proxy-api (ChatGPT) backend; depends on `skills/remote-cpa` |
 | `skills/multi-model-review-gate` | Bounded plan/execution review with ≤2 external critics + one adjudication; emits `EXECUTION_ROUTE` |
@@ -88,6 +88,9 @@ Optional env vars:
 | `OPENCODE_EXEC_ROUTING` | `on` | `off` disables all auto routing |
 | `OPENCODE_REASONING_EFFORT` | `low` | injected when the client sends none (prevents reasoning models from burning the whole token budget on hidden thinking) |
 | `OPENCODE_EXEC_ROUTE_FILE` | `~/.claude/exec_route.json` | where the skill route file lives |
+| `OPENCODE_SPLIT` | `on` | dual-upstream split: `glm-5.3` on opencode, everything else forwarded to the ollama shim; `off` disables |
+| `OLLAMA_SHIM_URL` | `http://127.0.0.1:11435` | split target (local ollama shim) |
+| `OPENCODE_SHIM_LOG` | `~/.claude/opencode_shim.log` | log file used when running under pythonw (no stderr) |
 
 ### 3. Point Claude Code at the shim
 

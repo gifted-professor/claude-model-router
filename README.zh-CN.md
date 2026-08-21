@@ -37,7 +37,7 @@ Claude Code ──► shim 127.0.0.1:11437 ──► OpenAI 兼容上游
 
 | 路径 | 说明 |
 |---|---|
-| `shims/opencode_anthropic_shim.py` | Anthropic `/v1/messages` → OpenAI `/chat/completions` 代理,带执行档自动路由、会话粘性、skill 路由文件支持、`reasoning_effort` 默认值注入 |
+| `shims/opencode_anthropic_shim.py` | Anthropic `/v1/messages` → OpenAI `/chat/completions` 代理,带执行档自动路由、会话粘性、skill 路由文件支持、`reasoning_effort` 默认值注入;内置 SSE 心跳(15s ping,防上游慢导致客户端指数退避)、上游失败自动重试(3 次指数退避)、流中断降级为 SSE error 事件、绕过系统代理直连上游;支持双上游分流——`glm-5.3` 留 opencode,其余模型透传给本地 ollama shim |
 | `shims/ollama_anthropic_shim.py` | 同样的思路,上游是本地 Ollama |
 | `shims/cpa_anthropic_shim.py` | 同样的思路,上游是 cli-proxy-api(ChatGPT);依赖 `skills/remote-cpa` |
 | `skills/multi-model-review-gate` | 有预算约束的计划/执行评审:≤2 个外部审查者 + 一次裁决;输出 `EXECUTION_ROUTE` |
@@ -84,6 +84,9 @@ python shims/opencode_anthropic_shim.py --host 127.0.0.1 --port 11437
 | `OPENCODE_EXEC_ROUTING` | `on` | 设为 `off` 关闭全部自动路由 |
 | `OPENCODE_REASONING_EFFORT` | `low` | 客户端没发时注入,防止推理模型把 token 预算全烧在隐藏思考上 |
 | `OPENCODE_EXEC_ROUTE_FILE` | `~/.claude/exec_route.json` | skill 路由文件位置 |
+| `OPENCODE_SPLIT` | `on` | 双上游分流:`glm-5.3` 走 opencode,其余模型转给 ollama shim;`off` 关闭 |
+| `OLLAMA_SHIM_URL` | `http://127.0.0.1:11435` | 分流目标(本地 ollama shim) |
+| `OPENCODE_SHIM_LOG` | `~/.claude/opencode_shim.log` | pythonw 后台运行(stderr 为空)时的日志落盘位置 |
 
 ### 3. 把 Claude Code 指向 shim
 
